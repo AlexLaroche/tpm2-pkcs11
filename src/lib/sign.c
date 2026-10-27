@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <stdlib.h>
 
+#include <openssl/crypto.h>
 #include <openssl/ec.h>
 #include <openssl/ecdsa.h>
 #include <openssl/evp.h>
@@ -23,9 +24,10 @@
 #include "token.h"
 #include "tpm.h"
 
-typedef struct sign_opdata sign_opdata;
 struct sign_opdata {
     CK_MECHANISM mech;
+    /* the key, which whoever made the state holds */
+    tobject *tobj;
     bool do_hash;
     twist buffer;
     digest_op_data *digest_opdata;
@@ -41,7 +43,7 @@ struct sign_opdata {
     bool updated;
 };
 
-static sign_opdata *sign_opdata_new(operation op, mdetail *mdtl, CK_MECHANISM_PTR mechanism, tobject *tobj) {
+static sign_opdata *sign_opdata_alloc(operation op, mdetail *mdtl, CK_MECHANISM_PTR mechanism, tobject *tobj) {
 
     int padding = 0;
     CK_RV rv = mech_get_padding(mdtl,
@@ -79,7 +81,7 @@ static sign_opdata *sign_opdata_new(operation op, mdetail *mdtl, CK_MECHANISM_PT
     }
 
     EVP_PKEY *pkey = NULL;
-    if (op != operation_sign) {
+    if (op != operation_sign && op != operation_sign_recover) {
         rv = ssl_util_attrs_to_evp(tobj->attrs, &pkey);
         if (rv != CKR_OK) {
             return NULL;
@@ -95,10 +97,11 @@ static sign_opdata *sign_opdata_new(operation op, mdetail *mdtl, CK_MECHANISM_PT
     opdata->padding = padding;
     opdata->pkey = pkey;
     opdata->md = md;
+    opdata->tobj = tobj;
     return opdata;
 }
 
-static void sign_opdata_free(sign_opdata **opdata) {
+void sign_opdata_free(sign_opdata **opdata) {
     digest_op_data_free(&(*opdata)->digest_opdata);
 
     if (*opdata && !(*opdata)->do_hash) {
@@ -158,30 +161,21 @@ static CK_RV update_pss_sig_state(token *tok, tobject *tobj) {
     return rv;
 }
 
-static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
+CK_RV sign_opdata_new(session_ctx *ctx, operation op, CK_MECHANISM_PTR mechanism, tobject *tobj,
+        sign_opdata **out) {
 
     check_pointer(mechanism);
-
-    LOGV("mechanism: 0x%lx\n\thas_params: %s\n\tlen: %lu", mechanism->mechanism,
-            mechanism->pParameter ? "yes" : "no", mechanism->ulParameterLen);
+    check_pointer(tobj);
+    check_pointer(out);
 
     CK_RV rv = CKR_GENERAL_ERROR;
-
-    bool is_active = session_ctx_opdata_is_active(ctx);
-    if (is_active) {
-        return CKR_OPERATION_ACTIVE;
-    }
 
     token *tok = session_ctx_get_token(ctx);
     assert(tok);
 
-    /* From here on, a failure goes through error, which releases the key and what was made. */
-    tobject *tobj = NULL;
-    rv = token_load_object(tok, key, &tobj);
-    if (rv != CKR_OK) {
-        return rv;
-    }
+    bool is_signing = op == operation_sign || op == operation_sign_recover;
 
+    /* A failure goes through error, which frees what was made; the key is the caller's. */
     digest_op_data *digest_opdata = NULL;
     tpm_op_data *tpm_opdata = NULL;
     sign_opdata *opdata = NULL;
@@ -199,6 +193,21 @@ static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechan
             LOGE("The key doesn't allow %s (%s=false)",
                     op == operation_sign ? "signing" : "verification",
                     op == operation_sign ? "CKA_SIGN" : "CKA_VERIFY");
+            rv = CKR_KEY_FUNCTION_NOT_PERMITTED;
+            goto error;
+        }
+    }
+
+    /* CKA_SIGN_RECOVER must be true (S32 5.13.5); a key without it can't have asked for it */
+    if (op == operation_sign_recover) {
+        if (attr_list_get_CKA_KEY_TYPE(tobj->attrs, CKA_KEY_TYPE_BAD) != CKK_RSA) {
+            LOGE("Signing with recovery needs an RSA key");
+            rv = CKR_KEY_TYPE_INCONSISTENT;
+            goto error;
+        }
+
+        if (!attr_list_get_CKA_SIGN_RECOVER(tobj->attrs, CK_FALSE)) {
+            LOGE("The key doesn't allow signing with recovery (CKA_SIGN_RECOVER=false)");
             rv = CKR_KEY_FUNCTION_NOT_PERMITTED;
             goto error;
         }
@@ -242,7 +251,7 @@ static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechan
         goto error;
     }
 
-    if (op == operation_sign || is_hmac) {
+    if (is_signing || is_hmac) {
 
         rv = update_pss_sig_state(tok, tobj);
         if (rv != CKR_OK) {
@@ -256,7 +265,7 @@ static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechan
         }
     }
 
-    opdata = sign_opdata_new(op, tok->mdtl,
+    opdata = sign_opdata_alloc(op, tok->mdtl,
             mechanism, tobj);
     if (!opdata) {
         rv = CKR_HOST_MEMORY;
@@ -276,7 +285,7 @@ static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechan
     }
 
     /* Use SW Verify if it's an asymmetric key with pkey set */
-    if (op != operation_sign && opdata->pkey) {
+    if (!is_signing && opdata->pkey) {
         opdata->crypto_opdata->use_sw = true;
         rv = sw_encrypt_data_init(tok->mdtl,
                 mechanism, tobj, &opdata->crypto_opdata->cryptopdata.sw_enc_data);
@@ -289,10 +298,7 @@ static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechan
         tpm_opdata = NULL;
     }
 
-    /*
-     * Store everything for later
-     */
-    session_ctx_opdata_set(ctx, op, tobj, opdata, (opdata_free_fn)sign_opdata_free);
+    *out = opdata;
 
     return CKR_OK;
 
@@ -302,13 +308,83 @@ error:
     }
     digest_op_data_free(&digest_opdata);
     tpm_opdata_free(&tpm_opdata);
-    tobject_user_decrement(tobj);
 
     return rv;
 }
 
+static CK_RV common_init(operation op, session_ctx *ctx, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
+
+    check_pointer(mechanism);
+
+    LOGV("mechanism: 0x%lx\n\thas_params: %s\n\tlen: %lu", mechanism->mechanism,
+            mechanism->pParameter ? "yes" : "no", mechanism->ulParameterLen);
+
+    CK_RV rv = CKR_GENERAL_ERROR;
+
+    rv = session_ctx_opdata_can_start(ctx, op);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    token *tok = session_ctx_get_token(ctx);
+    assert(tok);
+
+    /* a signature the data is recovered from: PKCS#1 v1.5 and raw RSA only */
+    if (op == operation_sign_recover) {
+        bool is_sign_recover = false;
+        rv = mech_is_sign_recover(tok->mdtl, mechanism->mechanism, &is_sign_recover);
+        if (rv != CKR_OK || !is_sign_recover) {
+            LOGE("Mechanism 0x%lx doesn't sign with recovery", mechanism->mechanism);
+            return CKR_MECHANISM_INVALID;
+        }
+    }
+
+    tobject *tobj = NULL;
+    rv = token_load_object(tok, key, &tobj);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    sign_opdata *opdata = NULL;
+    rv = sign_opdata_new(ctx, op, mechanism, tobj, &opdata);
+    if (rv != CKR_OK) {
+        tobject_user_decrement(tobj);
+        return rv;
+    }
+
+    /*
+     * Store everything for later
+     */
+    session_ctx_opdata_set(ctx, op, tobj, opdata, (opdata_free_fn)sign_opdata_free);
+
+    return CKR_OK;
+}
+
 /* Where empty data without a buffer is kept from: twistbin_new() takes no NULL, even for no bytes. */
 static const CK_BYTE nothing[1];
+
+CK_RV sign_opdata_update(sign_opdata *opdata, CK_BYTE_PTR part, CK_ULONG part_len) {
+
+    check_pointer(opdata);
+
+    /* Empty data may come without a buffer. */
+    if (!part && part_len) {
+        return CKR_ARGUMENTS_BAD;
+    }
+
+    if (opdata->do_hash) {
+        /* the digest is the state's own, so needs no session */
+        return digest_update_op(NULL, opdata->digest_opdata, part, part_len);
+    }
+
+    twist tmp = twistbin_append(opdata->buffer, part ? part : nothing, part_len);
+    if (!tmp) {
+        return CKR_HOST_MEMORY;
+    }
+    opdata->buffer = tmp;
+
+    return CKR_OK;
+}
 
 static CK_RV common_update(operation op, session_ctx *ctx, CK_BYTE_PTR part, CK_ULONG part_len) {
 
@@ -325,25 +401,12 @@ static CK_RV common_update(operation op, session_ctx *ctx, CK_BYTE_PTR part, CK_
         return rv;
     }
 
-    rv = session_ctx_tobject_authenticated(ctx);
+    rv = session_ctx_tobject_authenticated(ctx, op);
     if (rv != CKR_OK) {
         return rv;
     }
 
-    if (opdata->do_hash) {
-        rv = digest_update_op(ctx, opdata->digest_opdata, part, part_len);
-        if (rv != CKR_OK) {
-            return rv;
-        }
-    } else {
-        twist tmp = twistbin_append(opdata->buffer, part ? part : nothing, part_len);
-        if (!tmp) {
-            return CKR_HOST_MEMORY;
-        }
-        opdata->buffer = tmp;
-    }
-
-    return CKR_OK;
+    return sign_opdata_update(opdata, part, part_len);
 }
 
 CK_RV sign_init(session_ctx *ctx, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE key) {
@@ -394,30 +457,43 @@ CK_RV sign_update(session_ctx *ctx, CK_BYTE_PTR part, CK_ULONG part_len) {
     return update_or_end(operation_sign, CKF_SIGN, ctx, part, part_len, true);
 }
 
-CK_RV sign_final_ex(session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG_PTR signature_len, bool is_oneshot) {
+CK_RV sign_opdata_sig_len(sign_opdata *opdata, CK_ULONG_PTR sig_len) {
 
+    check_pointer(opdata);
+    check_pointer(sig_len);
+
+    size_t len = 0;
+    CK_RV rv = tobject_get_min_buf_size(opdata->tobj, &opdata->mech, &len);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    *sig_len = len;
+    return CKR_OK;
+}
+
+/*
+ * Whether sign_opdata_final() kept the state for the call to be made again: a length query, or
+ * CKR_BUFFER_TOO_SMALL. A failure to keep it is reported as an error.
+ */
+static bool sign_opdata_kept(CK_RV rv, CK_BYTE_PTR signature) {
+    return rv == CKR_BUFFER_TOO_SMALL || (rv == CKR_OK && !signature);
+}
+
+CK_RV sign_opdata_final(session_ctx *ctx, sign_opdata *opdata, CK_BYTE_PTR signature,
+        CK_ULONG_PTR signature_len, bool is_oneshot) {
+
+    check_pointer(opdata);
     check_pointer(signature_len);
 
     bool reset_ctx = false;
 
     CK_RV rv = CKR_GENERAL_ERROR;
 
-    sign_opdata *opdata = NULL;
-    rv = session_ctx_opdata_get(ctx, operation_sign, &opdata);
-    if (rv != CKR_OK) {
-        return rv;
-    }
-    assert(opdata);
-
-    rv = session_ctx_tobject_authenticated(ctx);
-    if (rv != CKR_OK) {
-        return rv;
-    }
-
     token *tok = session_ctx_get_token(ctx);
     assert(tok);
 
-    tobject *tobj = session_ctx_opdata_get_tobject(ctx);
+    tobject *tobj = opdata->tobj;
     assert(tobj);
 
     twist digest_buf = NULL;
@@ -428,13 +504,24 @@ CK_RV sign_final_ex(session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG_PTR signat
         return rv;
     }
 
+    /*
+     * The length is known before the data is used (S32 5.2): a multi-part operation is left as it
+     * is, for C_SignFinal to be called again; a single-part one is reset at out, as C_Sign gives the
+     * data again.
+     */
     if (!signature) {
         *signature_len = expected_sig_len;
+        if (!is_oneshot) {
+            return CKR_OK;
+        }
         goto out;
     }
 
     if (*signature_len < expected_sig_len) {
         *signature_len = expected_sig_len;
+        if (!is_oneshot) {
+            return CKR_BUFFER_TOO_SMALL;
+        }
         rv = CKR_BUFFER_TOO_SMALL;
         goto out;
     }
@@ -446,13 +533,14 @@ CK_RV sign_final_ex(session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG_PTR signat
                 &opdata->mech,
                 &mech_halg);
         if (rv != CKR_OK) {
-            return rv;
+            goto session_out;
         }
 
         CK_ULONG hash_len = utils_get_halg_size(mech_halg);
         if (!hash_len) {
             LOGE("Hash algorithm cannot have 0 size");
-            return CKR_GENERAL_ERROR;
+            rv = CKR_GENERAL_ERROR;
+            goto session_out;
         }
 
         digest_buf = twist_calloc(hash_len);
@@ -480,7 +568,7 @@ CK_RV sign_final_ex(session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG_PTR signat
     rv = mech_is_ecc(tok->mdtl, opdata->mech.mechanism, &is_ecc);
     if (rv != CKR_OK) {
         LOGE("COuld not determine if mechanism is ECC: %lu", rv);
-        return rv;
+        goto session_out;
     }
 
     if (is_ecc && (digest_buf_len > expected_sig_len)) {
@@ -589,6 +677,18 @@ out:
      * Reset the hashing state IF we're actually doing the hash internally
      */
     reset_ctx = (rv == CKR_BUFFER_TOO_SMALL || !signature);
+
+    /*
+     * A multi-part operation only gets here having used the data up, a too small buffer the TPM
+     * found despite the length given: the data can't be fed again, so there's no call to make again.
+     */
+    if (reset_ctx && !is_oneshot) {
+        LOGE("Signature longer than the %zu bytes expected", expected_sig_len);
+        reset_ctx = false;
+        rv = CKR_FUNCTION_FAILED;
+        goto session_out;
+    }
+
     if (reset_ctx) {
         if (opdata->do_hash) {
             /* reset the hashing state */
@@ -606,6 +706,8 @@ out:
             if (tmp != CKR_OK) {
                 digest_op_data_free(&new_digest_state);
                 reset_ctx = false;
+                /* the state is used up: say so, not that it was kept */
+                rv = tmp;
                 goto session_out;
             }
 
@@ -623,19 +725,53 @@ out:
 
 session_out:
     twist_free(digest_buf);
+    /* an internal buffer too small used the state up: no use making the call again */
+    if (!reset_ctx && sign_opdata_kept(rv, signature)) {
+        LOGE("Signing failed: 0x%lx", rv);
+        rv = CKR_FUNCTION_FAILED;
+    }
+
+    return rv;
+}
+
+/* Signs what operation op (sign, or sign-recover) collected, as sign_final_ex() does. */
+static CK_RV sign_final_op(operation op, session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG_PTR signature_len,
+        bool is_oneshot) {
+
+    check_pointer(signature_len);
+
+    sign_opdata *opdata = NULL;
+    CK_RV rv = session_ctx_opdata_get(ctx, op, &opdata);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+    assert(opdata);
+
+    rv = session_ctx_tobject_authenticated(ctx, op);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    tobject *tobj = session_ctx_opdata_get_tobject(ctx, op);
     assert(tobj);
-    if (!reset_ctx) {
+
+    rv = sign_opdata_final(ctx, opdata, signature, signature_len, is_oneshot);
+    if (!sign_opdata_kept(rv, signature)) {
         tobj->is_authenticated = false;
         CK_RV tmp_rv = tobject_user_decrement(tobj);
         if (tmp_rv != CKR_OK && rv == CKR_OK) {
             rv = tmp_rv;
         }
 
-        encrypt_op_data_free(&opdata->crypto_opdata);
-        session_ctx_opdata_clear(ctx);
+        session_ctx_opdata_clear(ctx, op);
     }
 
     return rv;
+}
+
+CK_RV sign_final_ex(session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG_PTR signature_len, bool is_oneshot) {
+
+    return sign_final_op(operation_sign, ctx, signature, signature_len, is_oneshot);
 }
 
 CK_RV sign(session_ctx *ctx, CK_BYTE_PTR data, CK_ULONG data_len, CK_BYTE_PTR signature, CK_ULONG *signature_len) {
@@ -645,6 +781,76 @@ CK_RV sign(session_ctx *ctx, CK_BYTE_PTR data, CK_ULONG data_len, CK_BYTE_PTR si
         return rv;
     }
     return sign_final_ex(ctx, signature, signature_len, true);
+}
+
+CK_RV sign_recover_init(session_ctx *ctx, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE key) {
+
+    return common_init(operation_sign_recover, ctx, mechanism, key);
+}
+
+/*
+ * C_SignRecover: single-part, with CKM_RSA_PKCS or CKM_RSA_X_509, signed as C_Sign signs. A DigestInfo
+ * under CKM_RSA_PKCS is signed with the TPM's RSASSA, anything else with unpadded RSA, which a TPM
+ * may refuse (CKR_FUNCTION_FAILED, as C_Sign gives).
+ */
+CK_RV sign_recover(session_ctx *ctx, CK_BYTE_PTR data, CK_ULONG data_len, CK_BYTE_PTR signature,
+        CK_ULONG_PTR signature_len) {
+
+    sign_opdata *opdata = NULL;
+    CK_RV rv = session_ctx_opdata_get(ctx, operation_sign_recover, &opdata);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    /* a bad argument ends the operation, as any error but the two the call may be made again after */
+    if (!signature_len || (!data && data_len)) {
+        session_ctx_cancel(ctx, CKF_SIGN_RECOVER);
+        return CKR_ARGUMENTS_BAD;
+    }
+
+    tobject *tobj = session_ctx_opdata_get_tobject(ctx, operation_sign_recover);
+    assert(tobj);
+
+    size_t k = 0;
+    rv = tobject_get_min_buf_size(tobj, &opdata->mech, &k);
+    if (rv != CKR_OK) {
+        session_ctx_cancel(ctx, CKF_SIGN_RECOVER);
+        return rv;
+    }
+
+    /* S32 tables 39 and 45: at most k-11 bytes for PKCS#1 v1.5, k for raw RSA */
+    bool is_raw = opdata->mech.mechanism == CKM_RSA_X_509;
+    size_t max = is_raw ? k : (k > 11 ? k - 11 : 0);
+    if (data_len > max) {
+        LOGE("Data of %lu bytes, at most %zu for the key and mechanism", data_len, max);
+        session_ctx_cancel(ctx, CKF_SIGN_RECOVER);
+        return CKR_DATA_LEN_RANGE;
+    }
+
+    /* raw RSA takes the data as a k-byte number: shorter data is prefixed with zeros (S32 6.1.12) */
+    twist padded = NULL;
+    if (is_raw && data_len < k) {
+        padded = twist_calloc(k);
+        if (!padded) {
+            LOGE("oom");
+            session_ctx_cancel(ctx, CKF_SIGN_RECOVER);
+            return CKR_HOST_MEMORY;
+        }
+        if (data_len) {
+            memcpy((CK_BYTE_PTR)padded + k - data_len, data, data_len);
+        }
+        data = (CK_BYTE_PTR)padded;
+        data_len = k;
+    }
+
+    /* the update ends the operation on error, but for a context-specific login still to come */
+    rv = update_or_end(operation_sign_recover, CKF_SIGN_RECOVER, ctx, data, data_len, false);
+    twist_free(padded);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    return sign_final_op(operation_sign_recover, ctx, signature, signature_len, true);
 }
 
 CK_RV verify_init (session_ctx *ctx, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE key) {
@@ -657,24 +863,11 @@ CK_RV verify_update (session_ctx *ctx, CK_BYTE_PTR part, CK_ULONG part_len) {
     return update_or_end(operation_verify, CKF_VERIFY, ctx, part, part_len, true);
 }
 
-/* Checks the signature over the data the operation collected, and ends the operation. */
-static CK_RV verify_final_op(operation op, session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG signature_len) {
+CK_RV verify_opdata_final(session_ctx *ctx, sign_opdata *opdata, CK_BYTE_PTR signature, CK_ULONG signature_len) {
+
+    check_pointer(opdata);
 
     CK_RV rv = CKR_GENERAL_ERROR;
-
-    sign_opdata *opdata = NULL;
-    rv = session_ctx_opdata_get(ctx, op, &opdata);
-    if (rv != CKR_OK) {
-        return rv;
-    }
-
-    rv = session_ctx_tobject_authenticated(ctx);
-    if (rv != CKR_OK) {
-        return rv;
-    }
-
-    tobject *tobj = session_ctx_opdata_get_tobject(ctx);
-    assert(tobj);
 
     CK_ULONG data_len = 0;
     CK_BYTE_PTR data = NULL;
@@ -703,16 +896,35 @@ static CK_RV verify_final_op(operation op, session_ctx *ctx, CK_BYTE_PTR signatu
     }
 
 out:
+    return rv;
+}
+
+/* Checks the signature over the data the operation collected, and ends the operation. */
+static CK_RV verify_final_op(operation op, session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG signature_len) {
+
+    sign_opdata *opdata = NULL;
+    CK_RV rv = session_ctx_opdata_get(ctx, op, &opdata);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    rv = session_ctx_tobject_authenticated(ctx, op);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    tobject *tobj = session_ctx_opdata_get_tobject(ctx, op);
     assert(tobj);
+
+    rv = verify_opdata_final(ctx, opdata, signature, signature_len);
+
     tobj->is_authenticated = false;
     CK_RV tmp_rv = tobject_user_decrement(tobj);
     if (tmp_rv != CKR_OK && rv == CKR_OK) {
         rv = tmp_rv;
     }
 
-    encrypt_op_data_free(&opdata->crypto_opdata);
-
-    session_ctx_opdata_clear(ctx);
+    session_ctx_opdata_clear(ctx, op);
 
     return rv;
 }
@@ -835,6 +1047,12 @@ CK_RV verify_recover_init (session_ctx *ctx, CK_MECHANISM *mechanism, CK_OBJECT_
     return common_init(operation_verify_recover, ctx, mechanism, key);
 }
 
+/*
+ * C_VerifyRecover. A length query (a NULL data) or CKR_BUFFER_TOO_SMALL leaves the operation, its key
+ * and the authentication as they were, for the call to be made again (S32 5.2); any other result,
+ * success or error, ends it. The signature is recovered into a buffer of the key's size, so that the
+ * length of the data is known before the caller's buffer is written to.
+ */
 CK_RV verify_recover (session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG signature_len,
         CK_BYTE_PTR data, CK_ULONG_PTR data_len) {
 
@@ -849,17 +1067,64 @@ CK_RV verify_recover (session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG signatur
         return rv;
     }
 
-    rv = session_ctx_tobject_authenticated(ctx);
+    rv = session_ctx_tobject_authenticated(ctx, operation_verify_recover);
     if (rv != CKR_OK) {
         return rv;
     }
 
-    tobject *tobj = session_ctx_opdata_get_tobject(ctx);
+    tobject *tobj = session_ctx_opdata_get_tobject(ctx, operation_verify_recover);
     assert(tobj);
 
+    CK_BYTE_PTR recovered = NULL;
+    CK_ULONG recovered_len = 0;
+    size_t k = 0;
+
+    if (!data_len) {
+        rv = CKR_ARGUMENTS_BAD;
+        goto out;
+    }
+
+    rv = tobject_get_min_buf_size(tobj, &opdata->mech, &k);
+    if (rv != CKR_OK) {
+        goto out;
+    }
+
+    /* the data is at most the key's size: the length asked for, with nothing to verify yet */
+    if (!data) {
+        *data_len = k;
+        return CKR_OK;
+    }
+
+    recovered = calloc(1, k ? k : 1);
+    if (!recovered) {
+        LOGE("oom");
+        rv = CKR_HOST_MEMORY;
+        goto out;
+    }
+
+    recovered_len = k;
     rv = ssl_util_verify_recover(opdata->pkey, opdata->padding, opdata->md,
-            signature, signature_len, data, data_len);
-    assert(tobj);
+            signature, signature_len, recovered, &recovered_len);
+    if (rv != CKR_OK) {
+        goto out;
+    }
+
+    if (*data_len < recovered_len) {
+        *data_len = recovered_len;
+        OPENSSL_cleanse(recovered, k);
+        free(recovered);
+        return CKR_BUFFER_TOO_SMALL;
+    }
+
+    memcpy(data, recovered, recovered_len);
+    *data_len = recovered_len;
+
+out:
+    if (recovered) {
+        OPENSSL_cleanse(recovered, k);
+    }
+    free(recovered);
+
     tobj->is_authenticated = false;
     CK_RV tmp_rv = tobject_user_decrement(tobj);
     if (tmp_rv != CKR_OK && rv == CKR_OK) {
@@ -868,7 +1133,7 @@ CK_RV verify_recover (session_ctx *ctx, CK_BYTE_PTR signature, CK_ULONG signatur
 
     encrypt_op_data_free(&opdata->crypto_opdata);
 
-    session_ctx_opdata_clear(ctx);
+    session_ctx_opdata_clear(ctx, operation_verify_recover);
 
     return rv;
 }

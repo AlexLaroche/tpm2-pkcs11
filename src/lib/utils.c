@@ -641,6 +641,59 @@ CK_RV utils_uncompressed_ecpoint_to_tpm2b(uint8_t* from, TPM2B_ECC_POINT* to, si
     return CKR_OK;
 }
 
+/* The DER header of an OCTET STRING of len bytes, len < 256: short form, or 0x81 then the length */
+static CK_ULONG der_octet_string_header(CK_ULONG len) {
+    return len < 128 ? 2 : 3;
+}
+
+CK_ULONG utils_ec_point_der_len(CK_ULONG field_size) {
+
+    CK_ULONG raw_len = 2 * field_size + 1;
+    return der_octet_string_header(raw_len) + raw_len;
+}
+
+/*
+ * PKCS#11 says a token MUST accept the other party's ECDH point raw and MAY accept it as a DER-encoded
+ * ECPoint, the same as CKA_EC_POINT; both are taken. The raw form is told apart by its length.
+ */
+bool utils_ec_point_unwrap(CK_BYTE_PTR data, CK_ULONG len, CK_ULONG field_size,
+        CK_BYTE_PTR *point, CK_ULONG *point_len) {
+
+    CK_ULONG raw_len = 2 * field_size + 1;
+    if (len == raw_len && data[0] == 0x04) {
+        *point = data;
+        *point_len = len;
+        return true;
+    }
+
+    /* DER OCTET STRING, definite length in short or long form. */
+    if (len < 2 || data[0] != 0x04) {
+        return false;
+    }
+
+    CK_ULONG header = 2;
+    CK_ULONG content = data[1];
+    if (data[1] & 0x80) {
+        CK_ULONG octets = data[1] & 0x7f;
+        if (octets < 1 || octets > 2 || len < 2 + octets) {
+            return false;
+        }
+        content = 0;
+        for (CK_ULONG i = 0; i < octets; i++) {
+            content = (content << 8) | data[2 + i];
+        }
+        header += octets;
+    }
+
+    if (content != raw_len || len != header + content || data[header] != 0x04) {
+        return false;
+    }
+
+    *point = &data[header];
+    *point_len = content;
+    return true;
+}
+
 /*
  * A TPM's format-one error code without the parameter, handle or session it was tied to, to compare with
  * TPM2_RC_VALUE and the like: a TPM2_TestParms refusal should say "parameter 1" (TPM2_RC_P | TPM2_RC_1),

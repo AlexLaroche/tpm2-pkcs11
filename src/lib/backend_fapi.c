@@ -659,6 +659,7 @@ CK_RV backend_fapi_update_tobject_attrs(token *t, tobject *tobj, attr_list *attr
     uint8_t *newappdata = malloc(newappdata_len);
     if (!newappdata) {
         LOGE("OOM");
+        free(attrs);
         Fapi_Free(appdata);
         goto error;
     }
@@ -668,6 +669,7 @@ CK_RV backend_fapi_update_tobject_attrs(token *t, tobject *tobj, attr_list *attr
     memcpy(&newappdata[tobj_start + 9 + strlen(attrs) + 1],
            &appdata[tobj_start + tobj_len + 1],
            appdata_len - tobj_start - tobj_len - 1);
+    free(attrs);
     newappdata[newappdata_len - 1] = '\0';
 
     Fapi_Free(appdata);

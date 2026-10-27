@@ -124,6 +124,20 @@ CK_RV tpm_ec_ecdsa_sha384_get_opdata(mdetail *m, tpm_ctx *tctx, CK_MECHANISM_PTR
 CK_RV tpm_ec_ecdsa_sha512_get_opdata(mdetail *m, tpm_ctx *tctx, CK_MECHANISM_PTR mech, tobject *tobj, tpm_op_data **opdata);
 CK_RV tpm_ec_ecdh1_derive(tpm_ctx *tctx, tobject *tobj, unsigned char *pubkey, size_t pubkey_len, unsigned char **psec, size_t *pseclen);
 
+/*
+ * The encapsulating half of ECDH (C_EncapsulateKey): TPM2_ECDH_KeyGen makes an ephemeral key pair on
+ * the curve of the EC public key pubkey, loaded from its CKA_EC_POINT under TPM2_RH_NULL, and gives
+ * Z, the x-coordinate of the ephemeral private key times the public point, and the ephemeral point.
+ * @param z
+ *  Z, as long as a field element; the caller cleanses and frees it.
+ * @param ephemeral_point
+ *  The ephemeral public point, uncompressed in a DER OCTET STRING as CKA_EC_POINT has it.
+ * @return
+ *  CKR_OK on success, CKR_CURVE_NOT_SUPPORTED for a curve the TPM code doesn't know, CKR_DATA_INVALID
+ *  when the TPM refuses the public point.
+ */
+CK_RV tpm_ec_ecdh_keygen(tpm_ctx *tctx, tobject *pubkey, twist *z, twist *ephemeral_point);
+
 CK_RV tpm_aes_cbc_get_opdata(mdetail *m, tpm_ctx *tctx, CK_MECHANISM_PTR mech, tobject *tobj, tpm_op_data **opdata);
 CK_RV tpm_aes_cfb_get_opdata(mdetail *m, tpm_ctx *tctx, CK_MECHANISM_PTR mech, tobject *tobj, tpm_op_data **opdata);
 CK_RV tpm_aes_ecb_get_opdata(mdetail *m, tpm_ctx *tctx, CK_MECHANISM_PTR mech, tobject *tobj, tpm_op_data **opdata);

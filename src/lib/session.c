@@ -67,6 +67,11 @@ CK_RV session_open(CK_SLOT_ID slot_id, CK_FLAGS flags, void *application,
         return CKR_SESSION_PARALLEL_NOT_SUPPORTED;
     }
 
+    /* Every function completes before it returns; CKF_ASYNC_SESSION_SUPPORTED is clear in the token info. */
+    if (flags & CKF_ASYNC_SESSION) {
+        return CKR_SESSION_ASYNC_NOT_SUPPORTED;
+    }
+
     CK_RV rv = CKR_GENERAL_ERROR;
 
 	check_pointer(session);

@@ -138,6 +138,8 @@ static void test_v3_lists_carry_v3_functions(void **state) {
     assert_ptr_equal(list->C_VerifySignatureFinal, C_VerifySignatureFinal);
     assert_ptr_equal(list->C_GetSessionValidationFlags, C_GetSessionValidationFlags);
     assert_ptr_equal(list->C_UnwrapKeyAuthenticated, C_UnwrapKeyAuthenticated);
+    assert_ptr_equal(list->C_EncapsulateKey, C_EncapsulateKey);
+    assert_ptr_equal(list->C_DecapsulateKey, C_DecapsulateKey);
 }
 
 static void test_info_reports_v3_2(void **state) {
@@ -149,14 +151,13 @@ static void test_info_reports_v3_2(void **state) {
     assert_int_equal(info.cryptokiVersion.minor, 2);
 }
 
-/* The v3.x functions the token doesn't provide say so, rather than failing otherwise. */
-static void test_unprovided_functions(void **state) {
+/* The v3.x functions the token refuses still check the library is initialized first. */
+static void test_refusals_need_init(void **state) {
     (void) state;
 
-    assert_int_equal(C_MessageEncryptInit(1, NULL, 1), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_int_equal(C_EncapsulateKey(1, NULL, 1, NULL, 0, NULL, NULL, NULL), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_int_equal(C_DecapsulateKey(1, NULL, 1, NULL, 0, NULL, 0, NULL), CKR_FUNCTION_NOT_SUPPORTED);
-    assert_int_equal(C_AsyncGetID(1, NULL, NULL), CKR_FUNCTION_NOT_SUPPORTED);
+    assert_int_equal(C_MessageEncryptInit(1, NULL, 1), CKR_CRYPTOKI_NOT_INITIALIZED);
+    assert_int_equal(C_AsyncGetID(1, NULL, NULL), CKR_CRYPTOKI_NOT_INITIALIZED);
+    assert_int_equal(C_WaitForSlotEvent(CKF_DONT_BLOCK, NULL, NULL), CKR_CRYPTOKI_NOT_INITIALIZED);
 }
 
 int main() {
@@ -170,7 +171,7 @@ int main() {
         cmocka_unit_test(test_function_list_is_v2_40),
         cmocka_unit_test(test_v3_lists_carry_v3_functions),
         cmocka_unit_test(test_info_reports_v3_2),
-        cmocka_unit_test(test_unprovided_functions),
+        cmocka_unit_test(test_refusals_need_init),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

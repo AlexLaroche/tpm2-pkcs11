@@ -144,9 +144,9 @@ static CK_RV common_init_op (session_ctx *ctx, encrypt_op_data *supplied_opdata,
     assert(tok);
 
     if (!supplied_opdata) {
-        bool is_active = session_ctx_opdata_is_active(ctx);
-        if (is_active) {
-            return CKR_OPERATION_ACTIVE;
+        CK_RV rv = session_ctx_opdata_can_start(ctx, op);
+        if (rv != CKR_OK) {
+            return rv;
         }
     }
 
@@ -249,7 +249,7 @@ static CK_RV common_update_op (session_ctx *ctx, encrypt_op_data *supplied_opdat
             return rv;
         }
 
-        rv = session_ctx_tobject_authenticated(ctx);
+        rv = session_ctx_tobject_authenticated(ctx, op);
         if (rv != CKR_OK) {
             return rv;
         }
@@ -309,7 +309,7 @@ static CK_RV common_final_op(session_ctx *ctx, encrypt_op_data *supplied_opdata,
             return rv;
         }
 
-        rv = session_ctx_tobject_authenticated(ctx);
+        rv = session_ctx_tobject_authenticated(ctx, op);
         if (rv != CKR_OK) {
             return rv;
         }
@@ -317,8 +317,12 @@ static CK_RV common_final_op(session_ctx *ctx, encrypt_op_data *supplied_opdata,
 
     assert(opdata);
 
-    tobject *tobj = session_ctx_opdata_get_tobject(ctx);
-    assert(tobj);
+    /* the internal callers (supplied opdata) release their key themselves */
+    tobject *tobj = NULL;
+    if (!supplied_opdata) {
+        tobj = session_ctx_opdata_get_tobject(ctx, op);
+        assert(tobj);
+    }
 
     /* we may have some TPM symmetric data to deal with */
     if (!opdata->use_sw) {
@@ -330,11 +334,13 @@ static CK_RV common_final_op(session_ctx *ctx, encrypt_op_data *supplied_opdata,
             goto out;
         }
 
-    } else if (!last_part) {
-        /* For all other encrypt operations deal with 5.2 style returns */
-        if (last_part_len) {
-            *last_part_len = 0;
-        }
+    } else {
+        /*
+         * RSA with the public key, in software, holds nothing back: there is no last part, whether
+         * this is a length query or not. Else C_Encrypt would add the rest of the caller's buffer to
+         * the length of the ciphertext.
+         */
+        *last_part_len = 0;
     }
 
     rv = CKR_OK;
@@ -346,18 +352,24 @@ out:
      * We also don't want to decrement the tobject unless we're using session ctx
      * not internal routines.
      */
-    reset_ctx = (rv == CKR_BUFFER_TOO_SMALL || !last_part);
+    reset_ctx = (rv == CKR_BUFFER_TOO_SMALL || (!last_part && rv == CKR_OK));
     if (reset_ctx) {
         if (is_oneshot && !opdata->use_sw) {
             tpm_opdata_reset(opdata->cryptopdata.tpm_opdata);
         }
-        /* all is well, we reset the command context */
-        rv = CKR_OK;
+        /*
+         * all is well, we reset the command context; a buffer too small for C_EncryptFinal or
+         * C_DecryptFinal says so, for the call to be made again with a bigger one. A length query
+         * that fails, on bad padding say, ends the operation with its error, as any other call.
+         */
+        if (is_oneshot) {
+            rv = CKR_OK;
+        }
     } else if(!supplied_opdata) {
         /* end the command context */
         tobj->is_authenticated = false;
         if (!supplied_opdata) {
-            session_ctx_opdata_clear(ctx);
+            session_ctx_opdata_clear(ctx, op);
         }
 
         CK_RV tmp_rv = tobject_user_decrement(tobj);

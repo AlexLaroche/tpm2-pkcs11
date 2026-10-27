@@ -22,6 +22,8 @@
 #include "session_ctx.h"
 #include "token.h"
 #include "tpm.h"
+#include "utils.h"
+#include "wrap.h"
 
 typedef struct sanity_check_data sanity_check_data;
 struct sanity_check_data {
@@ -139,52 +141,21 @@ CK_RV handle_value_len(const CK_ATTRIBUTE_PTR attr, void* userdat) {
     return rv;
 }
 
-/*
- * The other party's public point, uncompressed (04 || x || y) for a field of field_size bytes. PKCS#11
- * says a token MUST accept it raw and MAY accept it as a DER-encoded ECPoint, the same as CKA_EC_POINT;
- * both are taken. The raw form is told apart by its length.
- */
-static CK_RV ecdh_peer_point(CK_BYTE_PTR data, CK_ULONG len, unsigned field_size,
-        CK_BYTE_PTR *point, CK_ULONG *point_len) {
+CK_RV ecdh1_params_get(CK_MECHANISM_PTR mechanism, CK_ECDH1_DERIVE_PARAMS_PTR *params) {
 
-    CK_ULONG raw_len = 2 * field_size + 1;
-    if (len == raw_len && data[0] == 0x04) {
-        *point = data;
-        *point_len = len;
-        return CKR_OK;
+    if (!mechanism->pParameter || mechanism->ulParameterLen != sizeof(CK_ECDH1_DERIVE_PARAMS)) {
+        LOGE("Expected a CK_ECDH1_DERIVE_PARAMS");
+        return CKR_MECHANISM_PARAM_INVALID;
     }
 
-    /* DER OCTET STRING, definite length in short or long form. */
-    if (len < 2 || data[0] != 0x04) {
-        goto invalid;
+    CK_ECDH1_DERIVE_PARAMS_PTR p = (CK_ECDH1_DERIVE_PARAMS_PTR)mechanism->pParameter;
+    if (p->kdf != CKD_NULL) {
+        LOGE("Only CKD_NULL is supported as the ECDH1 KDF, got 0x%lx", p->kdf);
+        return CKR_MECHANISM_PARAM_INVALID;
     }
 
-    CK_ULONG header = 2;
-    CK_ULONG content = data[1];
-    if (data[1] & 0x80) {
-        CK_ULONG octets = data[1] & 0x7f;
-        if (octets < 1 || octets > 2 || len < 2 + octets) {
-            goto invalid;
-        }
-        content = 0;
-        for (CK_ULONG i = 0; i < octets; i++) {
-            content = (content << 8) | data[2 + i];
-        }
-        header += octets;
-    }
-
-    if (content != raw_len || len != header + content || data[header] != 0x04) {
-        goto invalid;
-    }
-
-    *point = &data[header];
-    *point_len = content;
+    *params = p;
     return CKR_OK;
-
-invalid:
-    LOGE("Expected the peer's uncompressed point for a %u-byte field, raw or DER-encoded, got %lu bytes",
-            field_size, len);
-    return CKR_MECHANISM_PARAM_INVALID;
 }
 
 CK_RV derive(session_ctx* ctx,  CK_MECHANISM_PTR mechanism, /* public EC point */
@@ -205,6 +176,12 @@ CK_RV derive(session_ctx* ctx,  CK_MECHANISM_PTR mechanism, /* public EC point *
     if (session_ctx_opdata_is_active(ctx))
         return CKR_OPERATION_ACTIVE;
 
+    /* before the TPM derives anything: the secret's CKA_UNIQUE_ID is the token's to give */
+    rv = attr_refuse_unique_id(secret_template, secret_template_count);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
     token* tok = session_ctx_get_token(ctx);
     assert(tok);
 
@@ -222,6 +199,23 @@ CK_RV derive(session_ctx* ctx,  CK_MECHANISM_PTR mechanism, /* public EC point *
         goto out;
     }
 
+    /*
+     * CKA_DERIVE=false is enforced on a key made by this token, which stores CKA_DECAPSULATE on every
+     * key pair it makes (attrs.c) and a CKA_DERIVE that says whether the template asked for ECDH
+     * (tpm.c). Such a key with the TPM's decrypt attribute for decapsulating alone doesn't derive, nor
+     * does its copy, or the key itself, once CKA_DECAPSULATE is turned off: Z would give the value of
+     * every key it ever decapsulated, the unextractable ones too. A key without CKA_DECAPSULATE was
+     * stored before it was known, by an older version of this token or by tpm2_ptool, with
+     * CKA_DERIVE=false whatever it was made for (objects.py, and the old keygen default): it derives
+     * through the TPM's decrypt attribute alone, as it always did.
+     */
+    if (!attr_list_get_CKA_DERIVE(tobj->attrs, CK_TRUE)
+            && attr_get_attribute_by_type(tobj->attrs, CKA_DECAPSULATE)) {
+        LOGE("The key doesn't allow derivation (CKA_DERIVE=false)");
+        rv = CKR_KEY_FUNCTION_NOT_PERMITTED;
+        goto out;
+    }
+
     /*  Validate the keysize against the one provided by the mechanism */
     CK_ATTRIBUTE_PTR a = attr_get_attribute_by_type(tobj->attrs, CKA_EC_PARAMS);
     if (!a) {
@@ -230,44 +224,16 @@ CK_RV derive(session_ctx* ctx,  CK_MECHANISM_PTR mechanism, /* public EC point *
         goto out;
     }
 
-    int nid = 0;
-    rv = ssl_util_params_to_nid(a, &nid);
+    CK_ULONG keysize = 0;
+    rv = ssl_util_ec_field_size(a, &keysize);
     if (rv != CKR_OK) {
         goto out;
     }
 
-    unsigned keysize;
-    switch (nid) {
-        case NID_X9_62_prime192v1:
-            keysize = 24;
-            break;
-        case NID_secp224r1:
-            keysize = 28;
-            break;
-        case NID_X9_62_prime256v1:
-            keysize = 32;
-            break;
-        case NID_secp384r1:
-            keysize = 48;
-            break;
-        case NID_secp521r1:
-            keysize = 66;
-            break;
-        default:
-            rv = CKR_CURVE_NOT_SUPPORTED;
-            goto out;
-    }
-
     /* 1. Get the public EC point to use in the derivation from the mechanism */
-    if (!mechanism->pParameter || mechanism->ulParameterLen != sizeof(CK_ECDH1_DERIVE_PARAMS)) {
-        rv = CKR_MECHANISM_PARAM_INVALID;
-        goto out;
-    }
-    CK_ECDH1_DERIVE_PARAMS_PTR mecha_params = (CK_ECDH1_DERIVE_PARAMS_PTR)mechanism->pParameter;
-
-    if (mecha_params->kdf != CKD_NULL) {
-        LOGE("Only CKD_NULL is supported as the ECDH1 KDF, got 0x%lx", mecha_params->kdf);
-        rv = CKR_MECHANISM_PARAM_INVALID;
+    CK_ECDH1_DERIVE_PARAMS_PTR mecha_params = NULL;
+    rv = ecdh1_params_get(mechanism, &mecha_params);
+    if (rv != CKR_OK) {
         goto out;
     }
 
@@ -279,9 +245,11 @@ CK_RV derive(session_ctx* ctx,  CK_MECHANISM_PTR mechanism, /* public EC point *
 
     CK_BYTE_PTR point = NULL;
     CK_ULONG point_len = 0;
-    rv = ecdh_peer_point(mecha_params->pPublicData, mecha_params->ulPublicDataLen, keysize,
-            &point, &point_len);
-    if (rv != CKR_OK) {
+    if (!utils_ec_point_unwrap(mecha_params->pPublicData, mecha_params->ulPublicDataLen, keysize,
+            &point, &point_len)) {
+        LOGE("Expected the peer's uncompressed point for a %lu-byte field, raw or DER-encoded, "
+                "got %lu bytes", keysize, mecha_params->ulPublicDataLen);
+        rv = CKR_MECHANISM_PARAM_INVALID;
         goto out;
     }
 
@@ -312,6 +280,10 @@ CK_RV derive(session_ctx* ctx,  CK_MECHANISM_PTR mechanism, /* public EC point *
     rv = tpm_ec_ecdh1_derive(tok->tctx, tobj, /* EC private */
                              point, point_len,
                              &shared_secret, &udata.len);
+    if (rv == CKR_DATA_INVALID) {
+        /* the TPM says the point isn't on the curve */
+        rv = CKR_MECHANISM_PARAM_INVALID;
+    }
     if (rv != CKR_OK) {
         goto out;
     }
@@ -328,7 +300,7 @@ CK_RV derive(session_ctx* ctx,  CK_MECHANISM_PTR mechanism, /* public EC point *
         goto out;
     }
 
-    rv = object_set_attributes(ctx, *secret, &shared_secret_attr, 1);
+    rv = object_set_derived_value(ctx, *secret, &shared_secret_attr);
     if (rv != CKR_OK) {
         goto out;
     }

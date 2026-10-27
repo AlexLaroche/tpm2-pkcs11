@@ -117,6 +117,7 @@ static attr_handler2 attr_handlers[] = {
     ADD_ATTR_HANDLER(CKA_CLASS, TYPE_BYTE_INT),
     ADD_ATTR_HANDLER(CKA_TOKEN, TYPE_BYTE_BOOL),
     ADD_ATTR_HANDLER(CKA_PRIVATE, TYPE_BYTE_BOOL),
+    ADD_ATTR_HANDLER(CKA_UNIQUE_ID, TYPE_BYTE_HEX_STR),
     ADD_ATTR_HANDLER(CKA_LABEL, TYPE_BYTE_HEX_STR),
     ADD_ATTR_HANDLER(CKA_APPLICATION, TYPE_BYTE_HEX_STR),
     ADD_ATTR_HANDLER(CKA_VALUE, TYPE_BYTE_HEX_STR),
@@ -166,6 +167,10 @@ static attr_handler2 attr_handlers[] = {
     ADD_ATTR_HANDLER(CKA_WRAP_WITH_TRUSTED, TYPE_BYTE_BOOL),
     ADD_ATTR_HANDLER(CKA_WRAP_TEMPLATE, TYPE_BYTE_TEMP_SEQ),
     ADD_ATTR_HANDLER(CKA_UNWRAP_TEMPLATE, TYPE_BYTE_TEMP_SEQ),
+    ADD_ATTR_HANDLER(CKA_ENCAPSULATE, TYPE_BYTE_BOOL),
+    ADD_ATTR_HANDLER(CKA_DECAPSULATE, TYPE_BYTE_BOOL),
+    ADD_ATTR_HANDLER(CKA_ENCAPSULATE_TEMPLATE, TYPE_BYTE_TEMP_SEQ),
+    ADD_ATTR_HANDLER(CKA_DECAPSULATE_TEMPLATE, TYPE_BYTE_TEMP_SEQ),
     ADD_ATTR_HANDLER(CKA_ALLOWED_MECHANISMS, TYPE_BYTE_INT_SEQ),
     ADD_ATTR_HANDLER(CKA_TPM2_OBJAUTH_ENC, TYPE_BYTE_HEX_STR),
     ADD_ATTR_HANDLER(CKA_TPM2_PUB_BLOB, TYPE_BYTE_HEX_STR),
@@ -663,11 +668,33 @@ static CK_RV attr_common_add_publickey(attr_list **public_attrs) {
     r = attr_list_add_int(new_attrs, CKA_CLASS, CKO_PUBLIC_KEY);
     goto_error_false(r);
 
-    r = attr_list_add_bool(new_attrs, CKA_WRAP, CK_FALSE);
-    goto_error_false(r);
+    /* the template may ask for it: C_WrapKey with an RSA key is done in software */
+    a = attr_get_attribute_by_type(*public_attrs, CKA_WRAP);
+    if (!a) {
+        r = attr_list_add_bool(new_attrs, CKA_WRAP, CK_FALSE);
+        goto_error_false(r);
+    }
 
-    r = attr_list_add_bool(new_attrs, CKA_VERIFY_RECOVER, CK_FALSE);
-    goto_error_false(r);
+    /* the template may ask for it: C_EncapsulateKey needs only the public key */
+    a = attr_get_attribute_by_type(*public_attrs, CKA_ENCAPSULATE);
+    if (!a) {
+        r = attr_list_add_bool(new_attrs, CKA_ENCAPSULATE, CK_FALSE);
+        goto_error_false(r);
+    }
+
+    /* empty, as CKA_WRAP_TEMPLATE: a key with one isn't used to encapsulate (see wrap.h) */
+    a = attr_get_attribute_by_type(*public_attrs, CKA_ENCAPSULATE_TEMPLATE);
+    if (!a) {
+        r = attr_list_add_buf(new_attrs, CKA_ENCAPSULATE_TEMPLATE, NULL, 0);
+        goto_error_false(r);
+    }
+
+    /* an RSA key pair's template may ask for it, see tpm.c's apply_usage() */
+    a = attr_get_attribute_by_type(*public_attrs, CKA_VERIFY_RECOVER);
+    if (!a) {
+        r = attr_list_add_bool(new_attrs, CKA_VERIFY_RECOVER, CK_FALSE);
+        goto_error_false(r);
+    }
 
     *public_attrs = attr_list_append_attrs(*public_attrs, &new_attrs);
     goto_error_false(*public_attrs);
@@ -830,15 +857,38 @@ static CK_RV attr_common_add_privatekey(attr_list **private_attrs) {
         goto_error_false(r);
     }
 
-    bool r = attr_list_add_bool(new_attrs, CKA_SIGN_RECOVER, CK_FALSE);
-    goto_error_false(r);
+    /* the key generator sets it from the template, see tpm.c's apply_usage() */
+    bool r = true;
+    a = attr_get_attribute_by_type(*private_attrs, CKA_SIGN_RECOVER);
+    if (!a) {
+        r = attr_list_add_bool(new_attrs, CKA_SIGN_RECOVER, CK_FALSE);
+        goto_error_false(r);
+    }
 
     r = attr_list_add_bool(new_attrs, CKA_SENSITIVE, CK_FALSE);
     goto_error_false(r);
 
 
-    r = attr_list_add_bool(new_attrs, CKA_UNWRAP, CK_FALSE);
-    goto_error_false(r);
+    /* the key generator sets it from the template, see tpm.c's apply_usage() */
+    a = attr_get_attribute_by_type(*private_attrs, CKA_UNWRAP);
+    if (!a) {
+        r = attr_list_add_bool(new_attrs, CKA_UNWRAP, CK_FALSE);
+        goto_error_false(r);
+    }
+
+    /* the key generator sets it from the template, see tpm.c's apply_usage() */
+    a = attr_get_attribute_by_type(*private_attrs, CKA_DECAPSULATE);
+    if (!a) {
+        r = attr_list_add_bool(new_attrs, CKA_DECAPSULATE, CK_FALSE);
+        goto_error_false(r);
+    }
+
+    /* empty, as CKA_UNWRAP_TEMPLATE: a key with one isn't used to decapsulate (see wrap.h) */
+    a = attr_get_attribute_by_type(*private_attrs, CKA_DECAPSULATE_TEMPLATE);
+    if (!a) {
+        r = attr_list_add_buf(new_attrs, CKA_DECAPSULATE_TEMPLATE, NULL, 0);
+        goto_error_false(r);
+    }
 
     r = attr_list_add_bool(new_attrs, CKA_WRAP_WITH_TRUSTED, CK_FALSE);
     goto_error_false(r);
@@ -1158,19 +1208,50 @@ static CK_RV attr_conditional_add(
     return CKR_OK;
 }
 
+CK_RV attr_refuse_trusted(CK_ATTRIBUTE_PTR templ, CK_ULONG count) {
+
+    if (count && !templ) {
+        return CKR_ARGUMENTS_BAD;
+    }
+
+    CK_ATTRIBUTE_PTR a = attr_get_attribute_by_type_raw(templ, count, CKA_TRUSTED);
+    if (!a) {
+        return CKR_OK;
+    }
+
+    CK_BBOOL trusted = CK_TRUE;
+    CK_RV rv = attr_CK_BBOOL(a, &trusted);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    if (trusted) {
+        LOGE("CKA_TRUSTED=true is the SO's to set, not a template's");
+        return CKR_ATTRIBUTE_READ_ONLY;
+    }
+
+    return CKR_OK;
+}
+
 /*
  * The attributes only the token sets, which PKCS#11 says can't be in a key template (CKR_ATTRIBUTE_READ_ONLY):
- * whether the key was made on the token, how, and whether it was ever extractable or not sensitive. An
- * imported key's template may say CKA_LOCAL=false, which is true of it.
+ * the object's CKA_UNIQUE_ID (4.4.1), whether the key was made on the token, how, and whether it was ever
+ * extractable or not sensitive. An imported key's template may say CKA_LOCAL=false, which is true of it.
+ * CKA_TRUSTED=true is refused too: see attr_refuse_trusted().
  */
 CK_RV attr_refuse_token_set(CK_ATTRIBUTE_PTR templ, CK_ULONG count, bool importing) {
 
     static const CK_ATTRIBUTE_TYPE token_set[] = {
-        CKA_LOCAL, CKA_KEY_GEN_MECHANISM, CKA_ALWAYS_SENSITIVE, CKA_NEVER_EXTRACTABLE,
+        CKA_UNIQUE_ID, CKA_LOCAL, CKA_KEY_GEN_MECHANISM, CKA_ALWAYS_SENSITIVE, CKA_NEVER_EXTRACTABLE,
     };
 
     if (count && !templ) {
         return CKR_ARGUMENTS_BAD;
+    }
+
+    CK_RV rv = attr_refuse_trusted(templ, count);
+    if (rv != CKR_OK) {
+        return rv;
     }
 
     CK_ULONG i;
@@ -1186,6 +1267,24 @@ CK_RV attr_refuse_token_set(CK_ATTRIBUTE_PTR templ, CK_ULONG count, bool importi
         }
 
         LOGE("%s is set by the token, not by a key template", attr_get_name(templ[i].type));
+        return CKR_ATTRIBUTE_READ_ONLY;
+    }
+
+    return CKR_OK;
+}
+
+/*
+ * The token gives every object its CKA_UNIQUE_ID: a template for an operation that makes an object can't
+ * (4.4.1, CKR_ATTRIBUTE_READ_ONLY).
+ */
+CK_RV attr_refuse_unique_id(CK_ATTRIBUTE_PTR templ, CK_ULONG count) {
+
+    if (count && !templ) {
+        return CKR_ARGUMENTS_BAD;
+    }
+
+    if (attr_get_attribute_by_type_raw(templ, count, CKA_UNIQUE_ID)) {
+        LOGE("CKA_UNIQUE_ID is set by the token, not by a template");
         return CKR_ATTRIBUTE_READ_ONLY;
     }
 
@@ -1224,9 +1323,9 @@ CK_RV attr_add_missing_attrs(attr_list **public_attrs, attr_list **private_attrs
      * agree with them. The public key's CKA_VERIFY and CKA_ENCRYPT are software operations, so the
      * template's value stands, and they default to what the private key allows.
      */
-    static const CK_ATTRIBUTE_TYPE private_strict[] = { CKA_SIGN, CKA_DECRYPT, CKA_DERIVE };
+    static const CK_ATTRIBUTE_TYPE private_strict[] = { CKA_SIGN, CKA_SIGN_RECOVER, CKA_DECRYPT, CKA_DERIVE };
     static const CK_ATTRIBUTE_TYPE private_skip[] = { CKA_VERIFY, CKA_ENCRYPT };
-    static const CK_ATTRIBUTE_TYPE public_skip[] = { CKA_SIGN, CKA_DECRYPT, CKA_DERIVE };
+    static const CK_ATTRIBUTE_TYPE public_skip[] = { CKA_SIGN, CKA_SIGN_RECOVER, CKA_DECRYPT, CKA_DERIVE };
 
     rv = attr_conditional_add(
             *private_attrs,
@@ -1432,3 +1531,5 @@ UTILS_GENERIC_EXTRACTOR(CKA_DECRYPT, CK_BBOOL);
 UTILS_GENERIC_EXTRACTOR(CKA_ENCRYPT, CK_BBOOL);
 UTILS_GENERIC_EXTRACTOR(CKA_SIGN, CK_BBOOL);
 UTILS_GENERIC_EXTRACTOR(CKA_VERIFY, CK_BBOOL);
+UTILS_GENERIC_EXTRACTOR(CKA_SIGN_RECOVER, CK_BBOOL);
+UTILS_GENERIC_EXTRACTOR(CKA_DERIVE, CK_BBOOL);

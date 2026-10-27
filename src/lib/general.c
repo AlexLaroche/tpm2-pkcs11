@@ -14,6 +14,7 @@
 #include "mutex.h"
 #include "pkcs11.h"
 #include "session.h"
+#include "slot.h"
 #include "utils.h"
 
 #ifndef VERSION
@@ -362,6 +363,9 @@ CK_RV general_finalize(void *reserved) {
     }
 
     _g_is_init = false;
+
+    /* a C_WaitForSlotEvent blocked returns CKR_CRYPTOKI_NOT_INITIALIZED (S32 5.5.4) */
+    slot_wake_waiters();
 
     slot_destroy();
     backend_destroy();

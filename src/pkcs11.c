@@ -2,23 +2,26 @@
 
 #include "config.h"
 
-#include <assert.h>
 #include <string.h>
 
 #include "pkcs11.h"
 
 #include "derive.h"
 #include "digest.h"
+#include "dual.h"
 #include "encrypt.h"
+#include "kem.h"
 #include "key.h"
 #include "log.h"
 #include "general.h"
+#include "message.h"
 #include "object.h"
 #include "random.h"
 #include "session.h"
 #include "sign.h"
 #include "slot.h"
 #include "token.h"
+#include "wrap.h"
 
 // TODO REMOVE ME
 #pragma GCC diagnostic push
@@ -74,30 +77,6 @@
   out: \
     _TRACE_RET(rv); \
     return rv;
-
-/**
- * Returns CKR_FUNCTION_NOT_SUPPORTED and if NDEBUG is 0, will cause an
- * assert(0) failure.
- * @return
- *  CKR_FUNCTION_NOT_SUPPORTED
- */
-#define TOKEN_UNSUPPORTED \
-        _TRACE_CALL; \
-        assert(0); \
-        _TRACE_RET(CKR_FUNCTION_NOT_SUPPORTED); \
-        return CKR_FUNCTION_NOT_SUPPORTED;
-
-/**
- * Returns CKR_FUNCTION_NOT_SUPPORTED for a function of the v3.x interfaces the token doesn't
- * provide. Unlike TOKEN_UNSUPPORTED it doesn't assert: an application using a v3.x interface may
- * call these to find out what the token does, and a debug build mustn't abort it for that.
- * @return
- *  CKR_FUNCTION_NOT_SUPPORTED
- */
-#define TOKEN_NOT_PROVIDED \
-        _TRACE_CALL; \
-        _TRACE_RET(CKR_FUNCTION_NOT_SUPPORTED); \
-        return CKR_FUNCTION_NOT_SUPPORTED;
 
 /**
  * Checks that the library is initialized, if not goes to a user specified
@@ -427,7 +406,7 @@ CK_RV C_GetTokenInfo (CK_SLOT_ID slotID, CK_TOKEN_INFO *info) {
 }
 
 CK_RV C_WaitForSlotEvent (CK_FLAGS flags, CK_SLOT_ID *slot, void *pReserved) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_CALL_INIT(slot_wait_for_event, flags, slot, pReserved);
 }
 
 CK_RV C_GetMechanismList (CK_SLOT_ID slotID, CK_MECHANISM_TYPE *mechanism_list, CK_ULONG_PTR count) {
@@ -467,11 +446,11 @@ CK_RV C_GetSessionInfo (CK_SESSION_HANDLE session, CK_SESSION_INFO *info) {
 }
 
 CK_RV C_GetOperationState (CK_SESSION_HANDLE session, CK_BYTE_PTR operation_state, CK_ULONG_PTR operation_state_len) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(session_ctx_get_operation_state, session, operation_state, operation_state_len);
 }
 
 CK_RV C_SetOperationState (CK_SESSION_HANDLE session, CK_BYTE_PTR operation_state, CK_ULONG operation_state_len, CK_OBJECT_HANDLE encryption_key, CK_OBJECT_HANDLE authentiation_key) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(session_ctx_set_operation_state, session, operation_state, operation_state_len, encryption_key, authentiation_key);
 }
 
 CK_RV C_Login (CK_SESSION_HANDLE session, CK_USER_TYPE user_type, CK_BYTE_PTR pin, CK_ULONG pin_len) {
@@ -487,7 +466,7 @@ CK_RV C_CreateObject (CK_SESSION_HANDLE session, CK_ATTRIBUTE *templ, CK_ULONG c
 }
 
 CK_RV C_CopyObject (CK_SESSION_HANDLE session, CK_OBJECT_HANDLE object, CK_ATTRIBUTE *templ, CK_ULONG count, CK_OBJECT_HANDLE *new_object) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RW(object_copy, session, object, templ, count, new_object);
 }
 
 CK_RV C_DestroyObject (CK_SESSION_HANDLE session, CK_OBJECT_HANDLE object) {
@@ -495,7 +474,7 @@ CK_RV C_DestroyObject (CK_SESSION_HANDLE session, CK_OBJECT_HANDLE object) {
 }
 
 CK_RV C_GetObjectSize (CK_SESSION_HANDLE session, CK_OBJECT_HANDLE object, CK_ULONG_PTR size) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(object_get_size, session, object, size);
 }
 
 CK_RV C_GetAttributeValue (CK_SESSION_HANDLE session, CK_OBJECT_HANDLE object, CK_ATTRIBUTE_PTR templ, CK_ULONG count) {
@@ -572,7 +551,7 @@ CK_RV C_DigestUpdate (CK_SESSION_HANDLE session, CK_BYTE_PTR part, CK_ULONG part
 }
 
 CK_RV C_DigestKey (CK_SESSION_HANDLE session, CK_OBJECT_HANDLE key) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(digest_key, session, key);
 }
 
 CK_RV C_DigestFinal (CK_SESSION_HANDLE session, CK_BYTE_PTR digest, CK_ULONG_PTR digest_len) {
@@ -599,11 +578,14 @@ CK_RV C_SignFinal (CK_SESSION_HANDLE session, CK_BYTE_PTR signature, CK_ULONG_PT
 }
 
 CK_RV C_SignRecoverInit (CK_SESSION_HANDLE session, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE key) {
-    TOKEN_UNSUPPORTED;
+    if (!mechanism) {
+        return cancel_operation(session, CKF_SIGN_RECOVER);
+    }
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(sign_recover_init, session, mechanism, key);
 }
 
 CK_RV C_SignRecover (CK_SESSION_HANDLE session, CK_BYTE_PTR data, CK_ULONG data_len, CK_BYTE_PTR signature, CK_ULONG_PTR signature_len) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(sign_recover, session, data, data_len, signature, signature_len);
 }
 
 CK_RV C_VerifyInit (CK_SESSION_HANDLE session, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE key) {
@@ -637,19 +619,19 @@ CK_RV C_VerifyRecover (CK_SESSION_HANDLE session, CK_BYTE_PTR signature, CK_ULON
 }
 
 CK_RV C_DigestEncryptUpdate (CK_SESSION_HANDLE session, CK_BYTE_PTR part, CK_ULONG part_len, CK_BYTE_PTR encrypted_part, CK_ULONG_PTR encrypted_part_len) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(dual_digest_encrypt_update, session, part, part_len, encrypted_part, encrypted_part_len);
 }
 
 CK_RV C_DecryptDigestUpdate (CK_SESSION_HANDLE session, CK_BYTE_PTR encrypted_part, CK_ULONG encrypted_part_len, CK_BYTE_PTR part, CK_ULONG_PTR part_len) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(dual_decrypt_digest_update, session, encrypted_part, encrypted_part_len, part, part_len);
 }
 
 CK_RV C_SignEncryptUpdate (CK_SESSION_HANDLE session, CK_BYTE_PTR part, CK_ULONG part_len, CK_BYTE_PTR encrypted_part, CK_ULONG_PTR encrypted_part_len) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(dual_sign_encrypt_update, session, part, part_len, encrypted_part, encrypted_part_len);
 }
 
 CK_RV C_DecryptVerifyUpdate (CK_SESSION_HANDLE session, CK_BYTE_PTR encrypted_part, CK_ULONG encrypted_part_len, CK_BYTE_PTR part, CK_ULONG_PTR part_len) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(dual_decrypt_verify_update, session, encrypted_part, encrypted_part_len, part, part_len);
 }
 
 CK_RV C_GenerateKey (CK_SESSION_HANDLE session, CK_MECHANISM *mechanism, CK_ATTRIBUTE *templ, CK_ULONG count, CK_OBJECT_HANDLE *key) {
@@ -661,11 +643,11 @@ CK_RV C_GenerateKeyPair (CK_SESSION_HANDLE session, CK_MECHANISM *mechanism, CK_
 }
 
 CK_RV C_WrapKey (CK_SESSION_HANDLE session, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE wrapping_key, CK_OBJECT_HANDLE key, CK_BYTE_PTR wrapped_key, CK_ULONG_PTR wrapped_key_len) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(key_wrap, session, mechanism, wrapping_key, key, wrapped_key, wrapped_key_len);
 }
 
 CK_RV C_UnwrapKey (CK_SESSION_HANDLE session, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE unwrapping_key, CK_BYTE_PTR wrapped_key, CK_ULONG wrapped_key_len, CK_ATTRIBUTE *templ, CK_ULONG attribute_count, CK_OBJECT_HANDLE *key) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RW(key_unwrap, session, mechanism, unwrapping_key, wrapped_key, wrapped_key_len, templ, attribute_count, key);
 }
 
 CK_RV C_DeriveKey (CK_SESSION_HANDLE session, CK_MECHANISM *mechanism, CK_OBJECT_HANDLE base_key, CK_ATTRIBUTE *templ, CK_ULONG attribute_count, CK_OBJECT_HANDLE *key) {
@@ -681,11 +663,11 @@ CK_RV C_GenerateRandom (CK_SESSION_HANDLE session, CK_BYTE_PTR random_data, CK_U
 }
 
 CK_RV C_GetFunctionStatus (CK_SESSION_HANDLE session) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(session_ctx_function_not_parallel, session);
 }
 
 CK_RV C_CancelFunction (CK_SESSION_HANDLE session) {
-    TOKEN_UNSUPPORTED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(session_ctx_function_not_parallel, session);
 }
 
 /*
@@ -708,99 +690,114 @@ CK_RV C_SessionCancel (CK_SESSION_HANDLE session, CK_FLAGS flags) {
     TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(session_ctx_cancel, session, flags);
 }
 
-/* The message-based functions: no mechanism the token lists has CKF_MESSAGE_* flags. */
+/*
+ * Message-based encryption: no mechanism the token lists has CKF_MESSAGE_ENCRYPT or CKF_MESSAGE_DECRYPT, so
+ * every mechanism is CKR_MECHANISM_INVALID and no process is ever there to use or end.
+ */
 
 CK_RV C_MessageEncryptInit (CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
-    TOKEN_NOT_PROVIDED;
+    if (!mechanism) {
+        return cancel_operation(session, CKF_MESSAGE_ENCRYPT);
+    }
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(message_crypt_init, session, mechanism, key);
 }
 
 CK_RV C_EncryptMessage (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR associated_data, CK_ULONG associated_data_len, CK_BYTE_PTR plaintext, CK_ULONG plaintext_len, CK_BYTE_PTR ciphertext, CK_ULONG_PTR ciphertext_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(message_crypt_not_initialized, session);
 }
 
 CK_RV C_EncryptMessageBegin (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR associated_data, CK_ULONG associated_data_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(message_crypt_not_initialized, session);
 }
 
 CK_RV C_EncryptMessageNext (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR plaintext_part, CK_ULONG plaintext_part_len, CK_BYTE_PTR ciphertext_part, CK_ULONG_PTR ciphertext_part_len, CK_FLAGS flags) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(message_crypt_not_initialized, session);
 }
 
 CK_RV C_MessageEncryptFinal (CK_SESSION_HANDLE session) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(message_crypt_not_initialized, session);
 }
 
 CK_RV C_MessageDecryptInit (CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
-    TOKEN_NOT_PROVIDED;
+    if (!mechanism) {
+        return cancel_operation(session, CKF_MESSAGE_DECRYPT);
+    }
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(message_crypt_init, session, mechanism, key);
 }
 
 CK_RV C_DecryptMessage (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR associated_data, CK_ULONG associated_data_len, CK_BYTE_PTR ciphertext, CK_ULONG ciphertext_len, CK_BYTE_PTR plaintext, CK_ULONG_PTR plaintext_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(message_crypt_not_initialized, session);
 }
 
 CK_RV C_DecryptMessageBegin (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR associated_data, CK_ULONG associated_data_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(message_crypt_not_initialized, session);
 }
 
 CK_RV C_DecryptMessageNext (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR ciphertext_part, CK_ULONG ciphertext_part_len, CK_BYTE_PTR plaintext_part, CK_ULONG_PTR plaintext_part_len, CK_FLAGS flags) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(message_crypt_not_initialized, session);
 }
 
 CK_RV C_MessageDecryptFinal (CK_SESSION_HANDLE session) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(message_crypt_not_initialized, session);
 }
 
 CK_RV C_MessageSignInit (CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
-    TOKEN_NOT_PROVIDED;
+    if (!mechanism) {
+        return cancel_operation(session, CKF_MESSAGE_SIGN);
+    }
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(message_sign_init, session, mechanism, key);
 }
 
 CK_RV C_SignMessage (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR data, CK_ULONG data_len, CK_BYTE_PTR signature, CK_ULONG_PTR signature_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(sign_message, session, parameter, parameter_len, data, data_len, signature, signature_len);
 }
 
 CK_RV C_SignMessageBegin (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(sign_message_begin, session, parameter, parameter_len);
 }
 
 CK_RV C_SignMessageNext (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR data, CK_ULONG data_len, CK_BYTE_PTR signature, CK_ULONG_PTR signature_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(sign_message_next, session, parameter, parameter_len, data, data_len, signature, signature_len);
 }
 
 CK_RV C_MessageSignFinal (CK_SESSION_HANDLE session) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(message_sign_final, session);
 }
 
 CK_RV C_MessageVerifyInit (CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE key) {
-    TOKEN_NOT_PROVIDED;
+    if (!mechanism) {
+        return cancel_operation(session, CKF_MESSAGE_VERIFY);
+    }
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(message_verify_init, session, mechanism, key);
 }
 
 CK_RV C_VerifyMessage (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR data, CK_ULONG data_len, CK_BYTE_PTR signature, CK_ULONG signature_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(verify_message, session, parameter, parameter_len, data, data_len, signature, signature_len);
 }
 
 CK_RV C_VerifyMessageBegin (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(verify_message_begin, session, parameter, parameter_len);
 }
 
 CK_RV C_VerifyMessageNext (CK_SESSION_HANDLE session, CK_VOID_PTR parameter, CK_ULONG parameter_len, CK_BYTE_PTR data, CK_ULONG data_len, CK_BYTE_PTR signature, CK_ULONG signature_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(verify_message_next, session, parameter, parameter_len, data, data_len, signature, signature_len);
 }
 
 CK_RV C_MessageVerifyFinal (CK_SESSION_HANDLE session) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(message_verify_final, session);
 }
 
 /*
  * PKCS#11 v3.2
  */
 
-/* No key encapsulation mechanism (ML-KEM and the like) is listed. */
+/* Key encapsulation with RSA (OAEP) and ECDH; no ML-KEM. Both make an object, as C_UnwrapKey. */
 CK_RV C_EncapsulateKey (CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE public_key, CK_ATTRIBUTE_PTR templ, CK_ULONG attribute_count, CK_BYTE_PTR ciphertext, CK_ULONG_PTR ciphertext_len, CK_OBJECT_HANDLE_PTR key) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RW(kem_encapsulate, session, mechanism, public_key, templ, attribute_count, ciphertext, ciphertext_len, key);
 }
 
 CK_RV C_DecapsulateKey (CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE private_key, CK_ATTRIBUTE_PTR templ, CK_ULONG attribute_count, CK_BYTE_PTR ciphertext, CK_ULONG ciphertext_len, CK_OBJECT_HANDLE_PTR key) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RW(kem_decapsulate, session, mechanism, private_key, templ, attribute_count, ciphertext, ciphertext_len, key);
 }
 
 /* Verification with the signature given first: every mechanism C_VerifyInit takes, as v3.2 requires. */
@@ -827,26 +824,26 @@ CK_RV C_GetSessionValidationFlags (CK_SESSION_HANDLE session, CK_SESSION_VALIDAT
     TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(session_ctx_get_validation_flags, session, type, flags);
 }
 
-/* Every function completes before it returns: nothing is ever asynchronous. */
+/* Every function completes before it returns (C_OpenSession refuses CKF_ASYNC_SESSION): nothing is ever asynchronous. */
 CK_RV C_AsyncComplete (CK_SESSION_HANDLE session, CK_UTF8CHAR_PTR function_name, CK_ASYNC_DATA_PTR result) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(session_ctx_async_complete, session, function_name, result);
 }
 
 CK_RV C_AsyncGetID (CK_SESSION_HANDLE session, CK_UTF8CHAR_PTR function_name, CK_ULONG_PTR id) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(session_ctx_async_get_id, session, function_name, id);
 }
 
 CK_RV C_AsyncJoin (CK_SESSION_HANDLE session, CK_UTF8CHAR_PTR function_name, CK_ULONG id, CK_BYTE_PTR data, CK_ULONG data_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_PUB_RO(session_ctx_async_join, session, function_name, id, data, data_len);
 }
 
-/* Key wrapping isn't supported, authenticated or not. */
+/* Authenticated wrapping is defined for AES-GCM and AES-CCM only, which the token doesn't have. */
 CK_RV C_WrapKeyAuthenticated (CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE wrapping_key, CK_OBJECT_HANDLE key, CK_BYTE_PTR associated_data, CK_ULONG associated_data_len, CK_BYTE_PTR wrapped_key, CK_ULONG_PTR wrapped_key_len) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RO(key_wrap_authenticated, session, mechanism, wrapping_key, key, associated_data, associated_data_len, wrapped_key, wrapped_key_len);
 }
 
 CK_RV C_UnwrapKeyAuthenticated (CK_SESSION_HANDLE session, CK_MECHANISM_PTR mechanism, CK_OBJECT_HANDLE unwrapping_key, CK_BYTE_PTR wrapped_key, CK_ULONG wrapped_key_len, CK_ATTRIBUTE_PTR templ, CK_ULONG attribute_count, CK_BYTE_PTR associated_data, CK_ULONG associated_data_len, CK_OBJECT_HANDLE_PTR key) {
-    TOKEN_NOT_PROVIDED;
+    TOKEN_WITH_LOCK_BY_SESSION_USER_RW(key_unwrap_authenticated, session, mechanism, unwrapping_key, wrapped_key, wrapped_key_len, templ, attribute_count, associated_data, associated_data_len, key);
 }
 
 // TODO REMOVE ME

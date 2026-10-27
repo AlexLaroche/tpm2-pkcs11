@@ -552,24 +552,25 @@ static void test_set_attribute_value_multiple_okay(void **state) {
 
     test_info *ti = test_info_from_state(state);
 
-    CK_UTF8CHAR url [] = "http://fakeurl.com";
+    /* CKA_URL is a certificate's: a key has CKA_ID */
+    CK_BYTE id[] = "mynewkeyid";
     CK_UTF8CHAR label[]  = "mynewkeylabel";
     CK_ATTRIBUTE template[] = {
       {CKA_LABEL, label, sizeof(label) - 1},
-      {CKA_URL,   url,   sizeof(url) - 1},
+      {CKA_ID,    id,    sizeof(id) - 1},
     };
 
     CK_RV rv = C_SetAttributeValue(ti->hSession, ti->hObject, template, ARRAY_LEN(template));
     assert_int_equal(rv, CKR_OK);
 
     memset(label, 0, sizeof(label));
-    memset(url, 0, sizeof(label));
+    memset(id, 0, sizeof(id));
 
     rv = C_GetAttributeValue(ti->hSession, ti->hObject, template, ARRAY_LEN(template));
     assert_int_equal(rv, CKR_OK);
 
     assert_memory_equal(template[0].pValue, "mynewkeylabel", template[0].ulValueLen);
-    assert_memory_equal(template[1].pValue, "http://fakeurl.com", template[1].ulValueLen);
+    assert_memory_equal(template[1].pValue, "mynewkeyid", template[1].ulValueLen);
 }
 
 int main() {

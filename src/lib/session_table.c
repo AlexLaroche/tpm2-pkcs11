@@ -215,6 +215,20 @@ void session_table_login_event(session_table *s_table, CK_USER_TYPE user) {
     }
 }
 
+void token_cancel_all_operations(token *tok) {
+
+    size_t i;
+    for (i=0; i < ARRAY_LEN(tok->s_table->table); i++) {
+
+        session_ctx *ctx = tok->s_table->table[i];
+        if (!ctx) {
+            continue;
+        }
+
+        session_ctx_cancel(ctx, ~(CK_FLAGS)CKF_FIND_OBJECTS);
+    }
+}
+
 void token_logout_all_sessions(token *tok) {
 
     size_t i;

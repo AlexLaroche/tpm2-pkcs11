@@ -83,8 +83,6 @@ CK_RV check_common_attrs(
     static const attr_handler common_attr_check_handlers[] = {
         { CKA_PRIVATE,           handle_sensitive     },
         { CKA_EXTRACTABLE,       handle_extractable   },
-        { CKA_SIGN_RECOVER,      handle_expect_false  },
-        { CKA_VERIFY_RECOVER,    handle_expect_false  },
         { CKA_TRUSTED,           handle_expect_false  },
     };
 
@@ -417,6 +415,8 @@ struct secret_template {
     CK_BBOOL decrypt;
     CK_BBOOL sign;
     CK_BBOOL verify;
+    CK_BBOOL wrap;
+    CK_BBOOL unwrap;
 };
 
 static CK_RV check_false(CK_ATTRIBUTE_PTR attr, const char *why) {
@@ -478,9 +478,12 @@ static CK_RV secret_template_check(CK_ATTRIBUTE_PTR attr, void *udata) {
     case CKA_VERIFY:
         rv = hmac ? attr_CK_BBOOL(attr, &t->verify) : check_false(attr, "there is no AES MAC mechanism");
         break;
+    /* an AES key wraps with CKM_AES_CBC_PAD, using the TPM's encrypt and decrypt as CKA_ENCRYPT does */
     case CKA_WRAP:
+        rv = hmac ? check_false(attr, "an HMAC key doesn't wrap keys") : attr_CK_BBOOL(attr, &t->wrap);
+        break;
     case CKA_UNWRAP:
-        rv = check_false(attr, "the token doesn't wrap keys");
+        rv = hmac ? check_false(attr, "an HMAC key doesn't unwrap keys") : attr_CK_BBOOL(attr, &t->unwrap);
         break;
     /*
      * CKA_DERIVE is kept as given: it permits derivation, and whether the token has a mechanism to
@@ -586,8 +589,8 @@ static CK_RV secret_key_attrs(token *tok, const secret_template *t, CK_ULONG val
         { CKA_DECRYPT, t->decrypt },
         { CKA_SIGN, t->sign },
         { CKA_VERIFY, t->verify },
-        { CKA_WRAP, CK_FALSE },
-        { CKA_UNWRAP, CK_FALSE },
+        { CKA_WRAP, t->wrap },
+        { CKA_UNWRAP, t->unwrap },
         { CKA_DERIVE, CK_FALSE },
         { CKA_SENSITIVE, CK_TRUE },
         { CKA_EXTRACTABLE, CK_FALSE },
@@ -645,24 +648,12 @@ static CK_RV secret_key_attrs(token *tok, const secret_template *t, CK_ULONG val
     return attr_common_add_storage(attrs);
 }
 
-/*
- * Makes a secret key in the TPM, under the token's primary key: an AES key the TPM generates
- * (C_GenerateKey), or an AES or HMAC key holding the template's CKA_VALUE (C_CreateObject). Its value
- * is never kept outside the TPM.
- */
-static CK_RV secret_key_create(session_ctx *ctx, CK_KEY_TYPE key_type, bool importing,
-        CK_ATTRIBUTE_PTR template, CK_ULONG attribute_count, CK_OBJECT_HANDLE_PTR key) {
-
-    token *tok = session_ctx_get_token(ctx);
-    assert(tok);
-
-    CK_RV rv = attr_refuse_token_set(template, attribute_count, importing);
-    if (rv != CKR_OK) {
-        return rv;
-    }
+/* Reads the template of a secret key made in the TPM into t, refusing what the key can't be */
+static CK_RV secret_template_read(CK_KEY_TYPE key_type, bool importing,
+        CK_ATTRIBUTE_PTR template, CK_ULONG attribute_count, secret_template *t) {
 
     bool hmac = is_hmac_key_type(key_type);
-    secret_template t = {
+    *t = (secret_template) {
         .key_type = key_type,
         .importing = importing,
         .encrypt = hmac ? CK_FALSE : CK_TRUE,
@@ -684,8 +675,35 @@ static CK_RV secret_key_create(session_ctx *ctx, CK_KEY_TYPE key_type, bool impo
         { CKA_EXTRACTABLE, secret_template_check },
         { CKA_SENSITIVE, secret_template_check },
     };
-    rv = attr_list_raw_invoke_handlers(template, attribute_count,
-            handlers, ARRAY_LEN(handlers), &t);
+    return attr_list_raw_invoke_handlers(template, attribute_count,
+            handlers, ARRAY_LEN(handlers), t);
+}
+
+CK_RV key_check_secret_template(CK_KEY_TYPE key_type, CK_ATTRIBUTE_PTR templ, CK_ULONG count) {
+
+    secret_template t;
+    return secret_template_read(key_type, true, templ, count, &t);
+}
+
+/*
+ * Makes a secret key in the TPM, under the token's primary key: an AES key the TPM generates
+ * (C_GenerateKey), or an AES or HMAC key holding the template's CKA_VALUE (C_CreateObject). Its value
+ * is never kept outside the TPM.
+ */
+static CK_RV secret_key_create(session_ctx *ctx, CK_KEY_TYPE key_type, bool importing,
+        CK_ATTRIBUTE_PTR template, CK_ULONG attribute_count, CK_OBJECT_HANDLE_PTR key) {
+
+    token *tok = session_ctx_get_token(ctx);
+    assert(tok);
+
+    CK_RV rv = attr_refuse_token_set(template, attribute_count, importing);
+    if (rv != CKR_OK) {
+        return rv;
+    }
+
+    bool hmac = is_hmac_key_type(key_type);
+    secret_template t;
+    rv = secret_template_read(key_type, importing, template, attribute_count, &t);
     if (rv != CKR_OK) {
         return rv;
     }
@@ -776,16 +794,18 @@ static CK_RV secret_key_create(session_ctx *ctx, CK_KEY_TYPE key_type, bool impo
                 t.value->pValue, value_len, &objdata);
     } else {
         /*
-         * The TPM refuses an AES key it can neither encrypt nor decrypt with, which PKCS#11 allows:
-         * such a key gets the TPM's decrypt attribute, and C_DecryptInit refuses it for its
-         * CKA_DECRYPT=false.
+         * Wrapping encrypts and unwrapping decrypts in the TPM, as CKA_ENCRYPT and CKA_DECRYPT ask;
+         * C_EncryptInit and C_DecryptInit still go by those. The TPM refuses an AES key it can
+         * neither encrypt nor decrypt with, which PKCS#11 allows: such a key gets the TPM's decrypt
+         * attribute, and C_DecryptInit refuses it for its CKA_DECRYPT=false.
          */
-        bool tpm_decrypt = t.decrypt || !t.encrypt;
+        bool tpm_encrypt = t.encrypt || t.wrap;
+        bool tpm_decrypt = t.decrypt || t.unwrap || !tpm_encrypt;
         rv = importing
             ? tpm2_import_aes_key(tok->tctx, tok->pobject.handle, tok->pobject.objauth, newauthhex,
-                    t.value->pValue, value_len, t.encrypt, tpm_decrypt, &objdata)
+                    t.value->pValue, value_len, tpm_encrypt, tpm_decrypt, &objdata)
             : tpm2_generate_aes_key(tok->tctx, tok->pobject.handle, tok->pobject.objauth, newauthhex,
-                    value_len * 8, t.encrypt, tpm_decrypt, &objdata);
+                    value_len * 8, tpm_encrypt, tpm_decrypt, &objdata);
     }
     if (rv != CKR_OK) {
         LOGE("Failed to make the secret key in the TPM");

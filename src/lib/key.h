@@ -44,6 +44,15 @@ CK_RV key_gen_secret(
 bool key_is_tpm_secret(CK_KEY_TYPE type);
 
 /**
+ * The checks key_import_secret() makes of a secret key's template that don't depend on its value: the
+ * usage attributes the key type can have, CKA_SENSITIVE and CKA_EXTRACTABLE. The template has no
+ * CKA_VALUE yet.
+ * @return
+ *  CKR_OK, or what key_import_secret() would give for the template.
+ */
+CK_RV key_check_secret_template(CK_KEY_TYPE key_type, CK_ATTRIBUTE_PTR templ, CK_ULONG count);
+
+/**
  * C_CreateObject of a secret key with its CKA_VALUE: an AES key (16, 24 or 32 bytes), or an HMAC key
  * (CKK_GENERIC_SECRET or a CKK_SHA*_HMAC type, up to 128 bytes, the most the TPM holds), made in the
  * TPM with that value. The value is never stored outside the TPM.

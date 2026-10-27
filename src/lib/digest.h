@@ -34,6 +34,21 @@ static inline CK_RV digest_update(session_ctx *ctx, unsigned char *part, unsigne
     return digest_update_op(ctx, NULL, part, part_len);
 }
 
+/**
+ * Digests a secret key's value as the next part of the active digest (C_DigestKey). Only a secret
+ * key whose value the host holds can be: one in the TPM never gives its value out.
+ * @param ctx
+ *  The session.
+ * @param key
+ *  The secret key.
+ * @return
+ *  CKR_OK on success.
+ *  CKR_OPERATION_NOT_INITIALIZED when no digest is active.
+ *  CKR_KEY_HANDLE_INVALID when key isn't an object.
+ *  CKR_KEY_INDIGESTIBLE when it isn't a secret key, or its value isn't on the host.
+ */
+CK_RV digest_key(session_ctx *ctx, CK_OBJECT_HANDLE key);
+
 CK_RV digest_final_op(session_ctx *ctx, digest_op_data *supplied_opdata, CK_BYTE_PTR digest, CK_ULONG_PTR digest_len);
 static inline CK_RV digest_final(session_ctx *ctx, unsigned char *digest, unsigned long *digest_len) {
     return digest_final_op(ctx, NULL, digest, digest_len);
